@@ -1,0 +1,19 @@
+{
+  "name": "munshot-skills",
+  "owner": {
+    "name": "techmuns",
+    "url": "https://github.com/techmuns"
+  },
+  "metadata": {
+    "description": "Central marketplace for Munshot Claude Code skills.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "dashboard-skill",
+      "source": "./dashboard-skill",
+      "description": "Build Munshot embedded financial dashboards with standard UI, SDK/auth context, datasource, export, layout, and dashboard pattern rules.",
+      "version": "1.0.0"
+    }
+  ]
+}

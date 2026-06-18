@@ -1,0 +1,267 @@
+## Datasource Registry
+
+The following datasources are available for dashboard development.
+
+Dashboard implementations should:
+
+- Use registered datasources whenever possible.
+- Use `datasource.service` with `base_urls` to build the full API URL.
+  - `fastapi` means call `https://fastapi.muns.io` + endpoint path.
+  - `nestjs` means call `https://devde.muns.io` + endpoint path.
+- Follow documented request and response contracts.
+- Respect rate limits and cache recommendations.
+- Use host-provided authentication.
+- Handle API failures gracefully.
+- Avoid introducing undocumented API dependencies.
+
+<!-- GENERATED CONTENT - DO NOT EDIT MANUALLY -->
+
+```yaml
+base_urls:
+  fastapi: https://fastapi.muns.io
+  nestjs: https://devde.muns.io
+datasources:
+- id: web_search
+  name: Web Search
+  description: Search the public internet using Brave Search.
+  service: fastapi
+  endpoint: POST /tools/web-search
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 60
+  request_fields:
+  - field: query
+    type: string
+    required: true
+    description: Search query
+  - field: country
+    type: string
+    required: false
+    description: Country code for localized results
+  response_fields:
+  - field: results
+    type: array
+    required: true
+    description: Structured search results
+  cache_ttl_seconds: 300
+- id: web_reader
+  name: Web Reader
+  description: Read and extract content from one or more URLs.
+  service: fastapi
+  endpoint: POST /tools/web-reader
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 60
+  request_fields:
+  - field: urls
+    type: string[]
+    required: true
+    description: URLs to extract content from
+  - field: task
+    type: string
+    required: false
+    description: Optional extraction objective
+  response_fields:
+  - field: results
+    type: object
+    required: true
+    description: Extracted page content
+  cache_ttl_seconds: 300
+- id: news_search
+  name: News Search
+  description: Search recent news articles.
+  service: fastapi
+  endpoint: POST /tools/news-search
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 60
+  request_fields:
+  - field: query
+    type: string
+    required: true
+  - field: country
+    type: string
+    required: false
+  - field: from_date
+    type: date
+    required: false
+  - field: to_date
+    type: date
+    required: false
+  response_fields:
+  - field: results
+    type: array
+    required: true
+    description: News articles
+  cache_ttl_seconds: 180
+- id: document_search
+  name: Document Search
+  description: Search proprietary documents indexed in Pinecone.
+  service: fastapi
+  endpoint: POST /tools/document-search
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 60
+  request_fields:
+  - field: query
+    type: string
+    required: true
+  - field: user_index
+    type: integer
+    required: true
+  - field: ticker_symbol
+    type: string|string[]
+    required: false
+  - field: from_date
+    type: date
+    required: false
+  - field: to_date
+    type: date
+    required: false
+  - field: categories
+    type: string[]
+    required: false
+  - field: doc_indexes
+    type: string[]
+    required: false
+  response_fields:
+  - field: structured_data
+    type: array
+    required: true
+  - field: citations
+    type: array
+    required: false
+  cache_ttl_seconds: 120
+- id: muns_chat
+  name: Muns Chat
+  description: Stream an AI answer for a dashboard question using Muns chat context, documents, tickers, and dashboard inputs.
+  service: nestjs
+  endpoint: POST /chat/chat-muns
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 30
+  request_fields:
+  - field: tasks
+    type: string[]
+    required: true
+    description: User question or task list. Usually provide one dashboard-specific question.
+  - field: query_context.chatHistory
+    type: object[]
+    required: true
+    description: Prior chat messages. Use [] for a new dashboard query.
+  - field: query_context.TICKER_SYMBOL
+    type: string[]
+    required: false
+    description: Tickers relevant to the dashboard.
+  - field: query_context.FROM_DATE
+    type: date
+    required: false
+    description: Start date for time-bounded analysis.
+  - field: query_context.TO_DATE
+    type: date
+    required: false
+    description: End date for time-bounded analysis.
+  - field: query_context.DOCUMENT_IDS
+    type: string[]
+    required: false
+    description: Uploaded document UUIDs to ground the answer.
+  - field: query_context.DOC_INDEX
+    type: integer[]
+    required: false
+    description: Internal document indexes when already known.
+  - field: query_context.DASHBOARD_INPUTS
+    type: object[]
+    required: false
+    description: Dashboard extraction inputs to forward into the model context.
+  - field: query_context.mode
+    type: enum
+    required: false
+    description: fast or expert. Defaults to expert.
+  - field: chat_id
+    type: string
+    required: false
+    description: Existing chat ID when continuing a prior chat.
+  response_fields:
+  - field: stream
+    type: text/event-stream
+    required: true
+    description: Raw streamed answer chunks from Muns AI.
+  - field: X-Chat-Id
+    type: header
+    required: true
+    description: Chat ID created or reused for the request.
+  - field: X-Message-Id
+    type: header
+    required: true
+    description: Message ID for the streamed response.
+  cache_ttl_seconds: 0
+- id: agent_run
+  name: Agent Run
+  description: Run a registered analyst agent and stream its output for dashboard generation or refresh workflows.
+  service: nestjs
+  endpoint: POST /agents/run
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 20
+  request_fields:
+  - field: agent_id
+    type: string
+    required: false
+    description: Active analyst UUID. Provide either agent_id or agent_library_id, not both.
+  - field: agent_library_id
+    type: string
+    required: false
+    description: Library agent UUID. Provide either agent_library_id or agent_id, not both.
+  - field: user_query
+    type: string
+    required: false
+    description: Specific dashboard question or run objective.
+  - field: metadata
+    type: object
+    required: false
+    description: Run context such as stock_ticker, from_date, to_date, urls, or autoAddUpcoming.
+  - field: DASHBOARD_INPUTS
+    type: object[]
+    required: false
+    description: Dashboard extraction inputs to include in agent context.
+  - field: CATEGORIES
+    type: string[]
+    required: false
+    description: Categories to include in the agent query context.
+  - field: WRITING_STYLES
+    type: string[]
+    required: false
+    description: Optional registered writing style names for output formatting.
+  response_fields:
+  - field: stream
+    type: text/event-stream
+    required: true
+    description: Raw streamed agent output.
+  - field: X-Active-Analyst-Id
+    type: header
+    required: true
+    description: Active analyst ID used for the run.
+  - field: X-Analyst-Output-Id
+    type: header
+    required: true
+    description: Analyst output ID where the run is persisted.
+  cache_ttl_seconds: 0
+auth_defaults:
+  timeout_seconds: 30
+  retry_attempts: 3
+  retry_backoff_factor: 2.0
+  ssl_verify: true
+naming_conventions:
+  dashboard_file_prefix: dashboard_
+  component_file_prefix: component_
+  hook_prefix: use
+  constant_prefix: DASHBOARD_
+```
+
+<!-- END GENERATED CONTENT -->
