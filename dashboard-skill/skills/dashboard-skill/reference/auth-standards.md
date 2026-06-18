@@ -16,6 +16,156 @@ Claude must integrate the SDK into every generated dashboard.
 
 Do not implement custom iframe messaging when the SDK can be used.
 
+The SDK is production-ready bidirectional communication between:
+
+- Host app: the Munshot website embedding dashboards in iframes.
+- Dashboard app: the embedded iframe dashboard.
+
+---
+
+### SDK Core Design
+
+The SDK is channel-based and supports flexible payloads:
+
+- `topic` + `data` event transport for publish/subscribe workflows.
+- Request/response workflows with correlation IDs and timeouts.
+- Origin controls and origin locking for security.
+- Payload size guardrails for stability.
+- Queueing until iframe is ready.
+
+All messages follow a versioned envelope:
+
+- `namespace`: SDK namespace discriminator.
+- `version`: protocol version.
+- `channelId`: unique channel per iframe registration.
+- `source`: `host` or `dashboard`.
+- `kind`: protocol verb.
+- `requestId`: optional correlation ID for requests/responses.
+- `payload`: flexible data object.
+
+Supported message kinds include:
+
+- `host:init`, `host:context:update`
+- `host:event`, `host:request`, `host:response`
+- `dashboard:ready`, `dashboard:event`, `dashboard:request`, `dashboard:response`
+- `dashboard:error`, `dashboard:request:context`
+
+---
+
+### Host-Side SDK API
+
+This section is mainly for the Munshot host app. Dashboard authors should understand it because it defines what the iframe receives.
+
+Import from `src/sdk/dashboards/index.ts`.
+
+Key methods:
+
+- `registerIframe(...)`
+- `unregisterIframe(...)`
+- `updateGlobalContext(...)`
+- `publish(frameKey, topic, data, options)`
+- `broadcast(topic, data, options)`
+- `request(frameKey, topic, data, options)`
+- `onTopic(topic, handler)`
+- `onRequest(topic, handler)`
+- `onMessage(handler)`
+
+Host-side example:
+
+```ts
+import { dashboardHostSdk } from "@/sdk/dashboards";
+
+// Register iframe once mounted
+dashboardHostSdk.registerIframe({
+  frameKey: "dashboard-123",
+  iframe: iframeElement,
+  dashboard: {
+    id: "123",
+    name: "Market Pulse",
+    category: "markets",
+    type: "iframe",
+  },
+  // optional explicit allow-list for cross-origin dashboards
+  allowedOrigins: ["https://dashboards.yourdomain.com"],
+});
+
+// Push host context updates
+dashboardHostSdk.updateGlobalContext({
+  session: { token, userName, email, orgId, orgName },
+  market: { selectedTicker, selectedSymbol },
+  app: { route, query, viewMode, selectedCategory, searchQuery },
+});
+
+// Subscribe to dashboard topic events
+dashboardHostSdk.onTopic("dashboard.metric", (payload, meta) => {
+  console.info("metric", payload.data, meta.dashboardId);
+});
+
+// Handle requests from dashboards
+dashboardHostSdk.onRequest("portfolio.get-selection", async () => {
+  return { selectedTicker: "AAPL" };
+});
+```
+
+---
+
+### Dashboard-Side SDK API
+
+Generated dashboards must use the dashboard-side client SDK.
+
+Use `createDashboardClientSdk(...)` from `src/sdk/dashboards/client.ts`.
+
+Key methods:
+
+- `ready()`
+- `requestContext()`
+- `publish(topic, data, metadata)`
+- `request(topic, data, options)`
+- `onTopic(topic, handler)`
+- `onRequest(topic, handler)`
+- `onMessage(handler)`
+- `sendError(...)`
+
+Dashboard-side example:
+
+```ts
+import { createDashboardClientSdk } from "@/sdk/dashboards/client";
+
+const sdk = createDashboardClientSdk({
+  dashboardId: "market-pulse",
+  dashboardName: "Market Pulse",
+});
+
+sdk.onTopic("host.theme.changed", (payload) => {
+  applyTheme(payload.data);
+});
+
+sdk.onRequest("dashboard.capture.snapshot", async () => {
+  return { ok: true, generatedAt: new Date().toISOString() };
+});
+
+sdk.publish("dashboard.metric", {
+  widget: "sector-heatmap",
+  action: "tile-click",
+  value: "technology",
+});
+```
+
+For browser-bundle dashboards, load the SDK script and use the global browser entry exposed by the bundle:
+
+```ts
+const sdk = window.MunshotDashboardSDK.createDashboardClientSdk({
+  dashboardId: "market-pulse",
+  dashboardName: "Market Pulse",
+});
+```
+
+For package-based dashboards, install/import the internal package when available:
+
+```ts
+import { createDashboardClientSdk } from "@munshot/dashboard-sdk";
+```
+
 ---
 
 ### Authentication Model
@@ -43,12 +193,13 @@ Generated dashboards must not:
 Every generated dashboard must:
 
 1. Load the Munshot Dashboard SDK.
-2. Initialize the dashboard SDK client during application startup.
-3. Register dashboard metadata.
-4. Signal dashboard readiness.
-5. Request initial host context.
-6. Subscribe to host context updates.
-7. Handle SDK disconnect and error scenarios.
+2. Initialize the dashboard SDK client during application startup using `createDashboardClientSdk(...)`.
+3. Register dashboard metadata through `dashboardId` and `dashboardName`.
+4. Register all `onTopic(...)`, `onRequest(...)`, and `onMessage(...)` handlers needed at startup.
+5. Signal dashboard readiness using `sdk.ready()`.
+6. Request initial host context using `sdk.requestContext()`.
+7. Subscribe to host context updates using `sdk.onMessage(...)` or topic handlers exposed by the SDK.
+8. Report dashboard errors through `sdk.sendError(...)` when appropriate.
 
 ---
 
@@ -168,8 +319,7 @@ export function useHostContext() {
   const [tickerCountry, setTickerCountry] = useState<string | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
-  const sync = () => {
-    const ctx = sdk.getContext() as any;
+  const applyContext = (ctx: any) => {
     if (!ctx) return;
 
     if (ctx.session) setSession({ ...ctx.session });
@@ -182,9 +332,18 @@ export function useHostContext() {
     }
   };
 
+  const sync = async () => {
+    const ctx = await sdk.requestContext();
+    applyContext(ctx);
+  };
+
   useEffect(() => {
     sync();
-    return sdk.onMessage(sync);
+    return sdk.onMessage((message: any) => {
+      const payload = message?.payload ?? message;
+      if (payload?.context) applyContext(payload.context);
+      if (payload?.session || payload?.market) applyContext(payload);
+    });
   }, []);
 
   return { session, ticker, tickerCompany, tickerCountry, selectedSymbol };
@@ -246,6 +405,14 @@ dashboard.metric
 dashboard.error
 ```
 
+For large dashboard fleets:
+
+- Use namespaced topics such as `analytics.filter.change` and `portfolio.ticker.select`.
+- Keep payloads small and pass references/IDs for large datasets.
+- Use request/response for critical workflows needing acknowledgement.
+- Use event topics for fire-and-forget telemetry.
+- Register wildcard handlers (`*`) only for observability pipelines.
+
 ---
 
 ### Visual UI Snapshots For Export
@@ -278,7 +445,7 @@ Example pattern:
 ```typescript
 import { toBlob } from "html-to-image";
 
-client.onRequest("dashboard.capture.visual", async () => {
+sdk.onRequest("dashboard.capture.visual", async () => {
   const mainElement =
     document.querySelector("#dashboard-main") ||
     document.querySelector("[data-dashboard-capture-root='true']") ||
@@ -309,6 +476,41 @@ client.onRequest("dashboard.capture.visual", async () => {
 ```
 
 Do not convert the visual snapshot to Base64 unless the host explicitly requires it. `Blob` transfer is faster and avoids SDK payload size limits because it can move through the browser structured clone algorithm.
+
+---
+
+### Security And Reliability Defaults
+
+The SDK provides these defaults and generated dashboards must not bypass them:
+
+- Cross-origin token redaction by default.
+- Origin locking on first valid message when an allow-list is not preconfigured.
+- Payload size limits using `DEFAULT_SDK_MAX_PAYLOAD_BYTES`.
+- Structured cloning for payload safety.
+- Request timeout handling using `DEFAULT_SDK_REQUEST_TIMEOUT_MS`.
+- Message queueing for pre-ready iframes.
+
+---
+
+### Publishing And Distribution
+
+Use one of the SDK distribution channels supported by Munshot:
+
+1. npm/internal package
+   - Publish `src/sdk/dashboards` as `@munshot/dashboard-sdk`.
+   - Consumer dashboards install and import the client SDK directly.
+
+2. Browser bundle
+   - Build browser entry `src/sdk/dashboards/browser.ts`.
+   - Host it on the Munshot static asset domain or CDN.
+   - Dashboard apps load it with the script tag and use `window.MunshotDashboardSDK`.
+
+Versioning rules:
+
+- Follow semver for protocol changes.
+- Use minor versions for backward-compatible additions.
+- Use major versions for breaking envelope or behavior changes.
+- Keep `DASHBOARD_SDK_VERSION` aligned with the published package/tag.
 
 ---
 
