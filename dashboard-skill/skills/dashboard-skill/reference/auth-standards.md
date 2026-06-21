@@ -1,552 +1,627 @@
-## Auth Standards
+## Auth & Host Communication Standards
 
-### Munshot Dashboard SDK (Required)
+Every dashboard built with this skill runs **inside the Munshot host as an iframe** and talks to the host through the **Munshot Dashboard SDK**. This file is the single source of truth for that integration. If you follow it exactly, the dashboard connects to the host on the first try and receives the user's session token and selected ticker automatically.
 
-All dashboards generated using this skill are embedded inside the Munshot platform as iframes.
+These standards are derived from the shipped SDK bundle (`munshot-dashboard-sdk.v1.0.0`) and the host context contract. Do not improvise around them — the handshake is timing-sensitive and small deviations silently break the connection (the dashboard renders but never receives a token).
 
-Dashboard-to-host communication must use the Munshot Dashboard SDK.
+---
 
-SDK Script:
+### 0. The Golden Rules (read first)
+
+These are non-negotiable. Most of them exist because violating them produces a **silent** failure (no error, dashboard just never connects).
+
+1. **Load the SDK as a classic `<script>` in `<head>`** — not as an ES module, not `async`/`defer`. It must define `window.MunshotDashboardSDK` before your app boots.
+2. **Create the SDK client exactly once, at module load** (`src/lib/sdk.ts`). The constructor attaches the `window` message listener immediately, so it can catch `host:init` even before React mounts.
+3. **Leave `autoReady` at its default (`true`). Never set it to `false`.**
+4. **Never call `sdk.ready()` yourself.** The SDK sends `dashboard:ready` automatically from inside its `host:init` handler — i.e. at the exact moment it has learned its `channelId`. Calling `ready()` manually from a mount effect races ahead of `host:init`, sends the ready with a placeholder channel the host cannot correlate, and the connection never completes.
+5. **Read context with `sdk.getContext()` and re-sync on every `sdk.onMessage(...)`.** Do not `await sdk.requestContext()` — `requestContext()` returns a **boolean**, not the context.
+6. **`onRequest` handlers must never throw and must return small, structured-cloneable data** (≤ 512 KB; plain JSON or `Blob`). A thrown error or a non-cloneable/oversized return value causes the response to be dropped and the host to **time out**.
+7. **No standalone auth.** No login pages, no hardcoded tokens/tickers, no secrets in the bundle. The host owns identity.
+
+---
+
+### 1. SDK Script
+
+Load the SDK from the Munshot CDN as a **classic blocking script**, before your application bundle:
 
 ```html
-<script src="https://munshot.s3.ap-south-1.amazonaws.com/SDK+script/munshot-dashboard-sdk.v1.0.0.min.js"></script>
+<!-- index.html -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Munshot Dashboard</title>
+
+    <!-- REQUIRED: classic script, in <head>, before the app module.
+         Defines window.MunshotDashboardSDK. Do NOT add type="module",
+         async, or defer — load order matters. -->
+    <script src="https://munshot.s3.ap-south-1.amazonaws.com/SDK+script/munshot-dashboard-sdk.v1.0.0.min.js"></script>
+
+    <style>
+      html, body, #root { margin: 0; padding: 0; height: 100%; }
+      body { overflow: hidden; } /* only the dashboard's Zone 2 scrolls */
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
 ```
 
-Claude must integrate the SDK into every generated dashboard.
+> **Why classic, not module:** the bundle is an IIFE. Loaded as a classic script, `window.MunshotDashboardSDK` resolves to the module namespace that exposes `createDashboardClientSdk`. Loaded as `type="module"`, the same global instead exposes `{ createClient, Client }`. The adapter below probes for all of these, but the classic-script form is the supported, tested setup.
 
-Do not implement custom iframe messaging when the SDK can be used.
-
-The SDK is production-ready bidirectional communication between:
-
-- Host app: the Munshot website embedding dashboards in iframes.
-- Dashboard app: the embedded iframe dashboard.
+If/when an internal package is published, you may instead `import { createDashboardClientSdk } from "@munshot/dashboard-sdk"` and skip the script tag. Until then, use the script tag.
 
 ---
 
-### SDK Core Design
+### 2. Required File Structure
 
-The SDK is channel-based and supports flexible payloads:
+The integration is intentionally split into small, fixed-responsibility files. Reproduce these exactly; only the dashboard's own widgets change between projects.
 
-- `topic` + `data` event transport for publish/subscribe workflows.
-- Request/response workflows with correlation IDs and timeouts.
-- Origin controls and origin locking for security.
-- Payload size guardrails for stability.
-- Queueing until iframe is ready.
+```
+src/
+  lib/sdk.ts              # SDK client singleton + types + no-op fallback  (copy verbatim, set id/name)
+  hooks/useHostContext.ts # session + market context as React state        (copy verbatim)
+  main.tsx                # mounts the app
+  <your-dashboard>.tsx    # your UI + host request handlers (capture.visual / capture.snapshot)
+index.html                # loads the SDK script (section 1)
+```
 
-All messages follow a versioned envelope:
+Install the one runtime dependency used by the visual snapshot handler:
 
-- `namespace`: SDK namespace discriminator.
-- `version`: protocol version.
-- `channelId`: unique channel per iframe registration.
-- `source`: `host` or `dashboard`.
-- `kind`: protocol verb.
-- `requestId`: optional correlation ID for requests/responses.
-- `payload`: flexible data object.
-
-Supported message kinds include:
-
-- `host:init`, `host:context:update`
-- `host:event`, `host:request`, `host:response`
-- `dashboard:ready`, `dashboard:event`, `dashboard:request`, `dashboard:response`
-- `dashboard:error`, `dashboard:request:context`
+```bash
+npm install html-to-image
+```
 
 ---
 
-### Host-Side SDK API
+### 3. `src/lib/sdk.ts` — copy verbatim
 
-This section is mainly for the Munshot host app. Dashboard authors should understand it because it defines what the iframe receives.
-
-Import from `src/sdk/dashboards/index.ts`.
-
-Key methods:
-
-- `registerIframe(...)`
-- `unregisterIframe(...)`
-- `updateGlobalContext(...)`
-- `publish(frameKey, topic, data, options)`
-- `broadcast(topic, data, options)`
-- `request(frameKey, topic, data, options)`
-- `onTopic(topic, handler)`
-- `onRequest(topic, handler)`
-- `onMessage(handler)`
-
-Host-side example:
+Set `DASHBOARD_ID` / `DASHBOARD_NAME` per dashboard. Change nothing else.
 
 ```ts
-import { dashboardHostSdk } from "@/sdk/dashboards";
+// src/lib/sdk.ts
+//
+// Munshot Dashboard SDK client adapter. Typed against the shipped bundle
+// (munshot-dashboard-sdk.v1.0.0). Creates ONE module-scoped client whose
+// window 'message' listener is attached on construction, so the SDK receives
+// and caches host:init even before the UI mounts.
 
-// Register iframe once mounted
-dashboardHostSdk.registerIframe({
-  frameKey: "dashboard-123",
-  iframe: iframeElement,
-  dashboard: {
-    id: "123",
-    name: "Market Pulse",
-    category: "markets",
-    type: "iframe",
-  },
-  // optional explicit allow-list for cross-origin dashboards
-  allowedOrigins: ["https://dashboards.yourdomain.com"],
-});
+export const DASHBOARD_ID = "your-dashboard-id";     // <-- set per dashboard
+export const DASHBOARD_NAME = "Your Dashboard Name"; // <-- set per dashboard
 
-// Push host context updates
-dashboardHostSdk.updateGlobalContext({
-  session: { token, userName, email, orgId, orgName },
-  market: { selectedTicker, selectedSymbol },
-  app: { route, query, viewMode, selectedCategory, searchQuery },
-});
-
-// Subscribe to dashboard topic events
-dashboardHostSdk.onTopic("dashboard.metric", (payload, meta) => {
-  console.info("metric", payload.data, meta.dashboardId);
-});
-
-// Handle requests from dashboards
-dashboardHostSdk.onRequest("portfolio.get-selection", async () => {
-  return { selectedTicker: "AAPL" };
-});
-```
-
----
-
-### Dashboard-Side SDK API
-
-Generated dashboards must use the dashboard-side client SDK.
-
-Use `createDashboardClientSdk(...)` from `src/sdk/dashboards/client.ts`.
-
-Key methods:
-
-- `ready()`
-- `requestContext()`
-- `publish(topic, data, metadata)`
-- `request(topic, data, options)`
-- `onTopic(topic, handler)`
-- `onRequest(topic, handler)`
-- `onMessage(handler)`
-- `sendError(...)`
-
-Dashboard-side example:
-
-```ts
-import { createDashboardClientSdk } from "@/sdk/dashboards/client";
-
-const sdk = createDashboardClientSdk({
-  dashboardId: "market-pulse",
-  dashboardName: "Market Pulse",
-});
-
-sdk.onTopic("host.theme.changed", (payload) => {
-  applyTheme(payload.data);
-});
-
-sdk.onRequest("dashboard.capture.snapshot", async () => {
-  return { ok: true, generatedAt: new Date().toISOString() };
-});
-
-sdk.publish("dashboard.metric", {
-  widget: "sector-heatmap",
-  action: "tile-click",
-  value: "technology",
-});
-```
-
-For browser-bundle dashboards, load the SDK script and use the global browser entry exposed by the bundle:
-
-```ts
-const sdk = window.MunshotDashboardSDK.createDashboardClientSdk({
-  dashboardId: "market-pulse",
-  dashboardName: "Market Pulse",
-});
-```
-
-For package-based dashboards, install/import the internal package when available:
-
-```ts
-import { createDashboardClientSdk } from "@munshot/dashboard-sdk";
-```
-
----
-
-### Authentication Model
-
-Authentication is owned by the Munshot host application.
-
-Generated dashboards must:
-
-- Consume authentication and user context from the SDK.
-- Assume the host application manages login, sessions, and token lifecycle.
-- Use SDK-provided session information when available.
-
-Generated dashboards must not:
-
-- Create standalone login pages.
-- Implement username/password authentication.
-- Store credentials in localStorage.
-- Embed API keys, secrets, or hardcoded tokens.
-- Require users to authenticate separately from Munshot.
-
----
-
-### Required SDK Lifecycle
-
-Every generated dashboard must:
-
-1. Load the Munshot Dashboard SDK.
-2. Initialize the dashboard SDK client during application startup using `createDashboardClientSdk(...)`.
-3. Register dashboard metadata through `dashboardId` and `dashboardName`.
-4. Register all `onTopic(...)`, `onRequest(...)`, and `onMessage(...)` handlers needed at startup.
-5. Signal dashboard readiness using `sdk.ready()`.
-6. Request initial host context using `sdk.requestContext()`.
-7. Subscribe to host context updates using `sdk.onMessage(...)` or topic handlers exposed by the SDK.
-8. Report dashboard errors through `sdk.sendError(...)` when appropriate.
-
----
-
-### Context Consumption
-
-Dashboards should expect context from the host application, including:
-
-- User information
-- Organization information
-- Session information
-- Selected ticker or symbol
-- Active filters
-- Application navigation state
-
-Dashboards must react to context updates without requiring a page refresh.
-
----
-
-### Host Context Contract
-
-The Munshot host automatically passes session and market context to embedded dashboards. Dashboards must treat this as the authoritative source for authentication, user identity, organization, and selected ticker.
-
-#### Contract 1: JWT Session
-
-On every context sync, the host sends:
-
-```typescript
-context.session = {
-  token: string | null;    // JWT bearer token for Munshot APIs
-  userName: string | null; // e.g. "Rahul Sharma"
-  email: string | null;    // e.g. "rahul@acme.com"
-  orgId: string | null;    // organization identifier
-  orgName: string | null;  // e.g. "Acme Capital"
-};
-```
-
-Token delivery rules:
-
-- On iframe load, the host sends `host:init` with full context, including `session.token`.
-- On login/session refresh, the host sends `host:context:update` with the new token.
-- On logout, `session.token` becomes `null` and a context update is pushed immediately.
-- The SDK queues messages until the dashboard sends `dashboard:ready`, so context should be available even if the dashboard takes time to boot.
-- The host forwards the user's JWT token regardless of dashboard domain origin. The dashboard domain must still be allowlisted in Munshot server-side CORS for API requests.
-
-Dashboards must use the token as a bearer header:
-
-```typescript
-fetch(apiUrl, {
-  headers: {
-    Authorization: `Bearer ${session.token}`,
-    "Content-Type": "application/json",
-  },
-});
-```
-
-If `session.token` is `null`, show a small non-blocking waiting state inside the relevant widget. Do not show a full-page error because token null can be transient on load.
-
-```tsx
-if (!session.token) {
-  return (
-    <div style={{ padding: 16, textAlign: "center", color: "#9ca3af", fontSize: 13 }}>
-      Waiting for session...
-    </div>
-  );
-}
-```
-
-#### Contract 2: Selected Ticker
-
-Whenever the user selects, changes, or clears a stock in the Munshot host UI, the host pushes:
-
-```typescript
-context.market = {
-  selectedTicker: string | null;        // e.g. "AAPL", "RELIANCE"
-  selectedTickerCompany: string | null; // e.g. "Apple Inc."
-  selectedTickerCountry: string | null; // e.g. "US", "IN"
-  selectedSymbol: string | null;        // TradingView format, e.g. "NASDAQ:AAPL"
-};
-```
-
-Ticker rules:
-
-- If no stock is selected, all market fields may be `null`.
-- Show an empty state when `selectedTicker === null`.
-- Do not attempt ticker-dependent API calls until both `selectedTicker` and `session.token` exist.
-- Re-fetch all ticker-dependent data when either `selectedTicker` or `session.token` changes.
-- Never hardcode a ticker in production dashboards.
-- Show the selected ticker prominently in the header using the indigo ticker pill from UI Standards.
-- If embedding TradingView, use `context.market.selectedSymbol` instead of `selectedTicker`.
-
-#### Authoritative React Hook
-
-Dashboards should centralize host context access in one hook:
-
-```tsx
-import { useEffect, useState } from "react";
-import { sdk } from "../lib/sdk";
-
-interface SessionContext {
-  token: string | null;
+export interface SessionContext {
+  token: string | null;     // JWT bearer token for Munshot APIs
   userName: string | null;
   email: string | null;
   orgId: string | null;
   orgName: string | null;
 }
 
+export interface MarketContext {
+  selectedTicker: string | null;        // e.g. "AAPL"
+  selectedTickerCompany: string | null; // e.g. "Apple Inc."
+  selectedTickerCountry: string | null; // e.g. "US"
+  selectedSymbol: string | null;        // TradingView format, e.g. "NASDAQ:AAPL"
+}
+
+export interface AppContext {
+  route: string | null;
+  query: string | null;
+  viewMode: string | null;        // "grid" | "list"
+  selectedCategory: string | null;
+  searchQuery: string | null;
+}
+
+export interface DashboardHostContext {
+  session?: SessionContext;
+  market?: MarketContext;
+  app?: AppContext;
+}
+
+export interface DashboardSdkEnvelope {
+  namespace: string;
+  version: string;
+  channelId: string;
+  source: "host" | "dashboard";
+  kind: string;       // "host:init" | "host:context:update" | "host:event" | ...
+  timestamp: number;
+  requestId?: string;
+  payload?: any;
+}
+
+export interface NormalizedTopic {
+  topic: string;
+  data: any;
+  metadata?: any;
+}
+
+export interface TopicMeta {
+  origin: string;
+  topic: string;
+  requestId?: string;
+}
+
+export interface RequestOptions {
+  timeoutMs?: number;
+  metadata?: unknown;
+}
+
+export interface DashboardClientSdk {
+  getContext(): DashboardHostContext | null;
+  getChannelId(): string | null;
+  onMessage(
+    handler: (envelope: DashboardSdkEnvelope, meta: { origin: string }) => void,
+  ): () => void;
+  onTopic(
+    topic: string,
+    handler: (t: NormalizedTopic, meta: TopicMeta, env: DashboardSdkEnvelope) => void,
+  ): () => void;
+  onRequest(
+    topic: string,
+    handler: (
+      t: NormalizedTopic,
+      meta: TopicMeta,
+      env: DashboardSdkEnvelope,
+    ) => unknown | Promise<unknown>,
+  ): () => void;
+  ready(): boolean;
+  requestContext(): boolean;
+  publish(topic: string, data?: unknown, metadata?: unknown): boolean;
+  request(topic: string, data?: unknown, options?: RequestOptions): Promise<any>;
+  sendError(message: string, code?: string, details?: unknown): boolean;
+  destroy(): void;
+}
+
+export interface CreateClientConfig {
+  dashboardId: string;
+  dashboardName?: string;
+  autoReady?: boolean;            // DEFAULT true — leave it
+  requestTimeoutMs?: number;      // default 15000
+  maxPayloadBytes?: number;       // default 524288 (512 KB)
+  lockOriginOnFirstMessage?: boolean; // default true
+  allowedOrigins?: string[];
+  targetWindow?: Window | null;   // default window.parent ?? window.opener
+  targetOrigin?: string;          // default "*"
+}
+
+type SdkFactory = (config: CreateClientConfig) => DashboardClientSdk;
+type SdkCtor = new (config: CreateClientConfig) => DashboardClientSdk;
+
+declare global {
+  interface Window {
+    MunshotDashboardSDK?: {
+      createDashboardClientSdk?: SdkFactory;
+      createClient?: SdkFactory;
+      DashboardClientSdk?: SdkCtor;
+      Client?: SdkCtor;
+    };
+  }
+}
+
+// Faithful no-op, used ONLY when the SDK script is absent (e.g. running the
+// build standalone outside the Munshot host). Return types match the real
+// client so app code behaves identically.
+function createNoopSdk(): DashboardClientSdk {
+  return {
+    getContext: () => null,
+    getChannelId: () => null,
+    onMessage: () => () => {},
+    onTopic: () => () => {},
+    onRequest: () => () => {},
+    ready: () => false,
+    requestContext: () => false,
+    publish: () => false,
+    request: async () => null,
+    sendError: () => false,
+    destroy: () => {},
+  };
+}
+
+function initSdk(): DashboardClientSdk {
+  const g = window.MunshotDashboardSDK;
+  const config: CreateClientConfig = {
+    dashboardId: DASHBOARD_ID,
+    dashboardName: DASHBOARD_NAME,
+    // Leave autoReady default (true). The SDK sends dashboard:ready itself
+    // from inside its host:init handler, once it knows the channelId.
+  };
+
+  const factory = g?.createDashboardClientSdk ?? g?.createClient;
+  if (typeof factory === "function") {
+    try {
+      return factory(config);
+    } catch (err) {
+      console.error("[dashboard] SDK factory failed", err);
+    }
+  }
+
+  const Ctor = g?.DashboardClientSdk ?? g?.Client;
+  if (typeof Ctor === "function") {
+    try {
+      return new Ctor(config);
+    } catch (err) {
+      console.error("[dashboard] SDK constructor failed", err);
+    }
+  }
+
+  console.warn(
+    "[dashboard] MunshotDashboardSDK not found; using no-op SDK. " +
+      "Expected only when running outside the Munshot host iframe.",
+  );
+  return createNoopSdk();
+}
+
+// Single client for the whole app. Created at import time so its message
+// listener is live before host:init can arrive.
+export const sdk: DashboardClientSdk = initSdk();
+```
+
+---
+
+### 4. `src/hooks/useHostContext.ts` — copy verbatim
+
+This is the authoritative way to consume host context. It reads whatever the SDK has cached, then re-syncs on every host message.
+
+```ts
+// src/hooks/useHostContext.ts
+import { useEffect, useState } from "react";
+import { sdk, type SessionContext } from "../lib/sdk";
+
+const EMPTY_SESSION: SessionContext = {
+  token: null, userName: null, email: null, orgId: null, orgName: null,
+};
+
 export function useHostContext() {
-  const [session, setSession] = useState<SessionContext>({
-    token: null,
-    userName: null,
-    email: null,
-    orgId: null,
-    orgName: null,
-  });
+  const [session, setSession] = useState<SessionContext>(EMPTY_SESSION);
   const [ticker, setTicker] = useState<string | null>(null);
   const [tickerCompany, setTickerCompany] = useState<string | null>(null);
   const [tickerCountry, setTickerCountry] = useState<string | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
-  const applyContext = (ctx: any) => {
-    if (!ctx) return;
-
-    if (ctx.session) setSession({ ...ctx.session });
-
-    if (ctx.market) {
-      setTicker(ctx.market.selectedTicker ?? null);
-      setTickerCompany(ctx.market.selectedTickerCompany ?? null);
-      setTickerCountry(ctx.market.selectedTickerCountry ?? null);
-      setSelectedSymbol(ctx.market.selectedSymbol ?? null);
-    }
-  };
-
-  const sync = async () => {
-    const ctx = await sdk.requestContext();
-    applyContext(ctx);
-  };
-
   useEffect(() => {
-    sync();
-    return sdk.onMessage((message: any) => {
-      const payload = message?.payload ?? message;
-      if (payload?.context) applyContext(payload.context);
-      if (payload?.session || payload?.market) applyContext(payload);
-    });
+    const sync = () => {
+      const ctx = sdk.getContext();
+      if (!ctx) return;
+      if (ctx.session) setSession({ ...EMPTY_SESSION, ...ctx.session });
+      if (ctx.market) {
+        setTicker(ctx.market.selectedTicker ?? null);
+        setTickerCompany(ctx.market.selectedTickerCompany ?? null);
+        setTickerCountry(ctx.market.selectedTickerCountry ?? null);
+        setSelectedSymbol(ctx.market.selectedSymbol ?? null);
+      }
+    };
+
+    sync();                    // apply already-cached context (host:init may
+                               // have arrived before this component mounted)
+    return sdk.onMessage(sync); // re-sync on every host message; returns unsub
   }, []);
 
   return { session, ticker, tickerCompany, tickerCountry, selectedSymbol };
 }
 ```
 
-Use it in widgets like this:
+> **Do not** call `sdk.ready()` or `sdk.requestContext()` here, and **do not** add an `await`. Connection (`dashboard:ready`) is handled by the SDK; this hook only reads.
+
+---
+
+### 5. Host Request Handlers + Bootstrap (in your dashboard component)
+
+The host can send **requests** to the dashboard. You must handle two, and your handlers must be bulletproof (rule #6). Register them in a single mount effect. **Do not call `ready()`.**
 
 ```tsx
-function MyWidget() {
-  const { session, ticker } = useHostContext();
+import { useEffect, useRef } from "react";
+import { toBlob } from "html-to-image";
+import { sdk } from "./lib/sdk";
+
+export function Dashboard() {
+  // A getter pointing at the dashboard's current state, reassigned each render
+  // so the snapshot handler always reads live values without stale closures.
+  const snapshotRef = useRef<() => unknown>(() => ({}));
+
+  // ... your widgets/state ...
+
+  // Keep the snapshot getter current (cap large fields so the payload stays
+  // small and structured-cloneable — see rule #6).
+  snapshotRef.current = () => ({
+    context:   { /* current filters, selected ticker, etc. */ },
+    selection: { /* what the user has selected inside the dashboard */ },
+    data:      { /* aggregated/derived data, bounded in size */ },
+  });
 
   useEffect(() => {
-    if (!ticker || !session.token) return;
-    fetchMyData(ticker, session.token);
-  }, [ticker, session.token]);
+    // 1) Visual snapshot — return a PNG Blob of Zone 2.
+    const offVisual = sdk.onRequest("dashboard.capture.visual", async () => {
+      try {
+        const el =
+          document.querySelector("#dashboard-main") ||
+          document.querySelector("[data-dashboard-capture-root='true']") ||
+          document.querySelector("main");
+        if (!el) throw new Error("capture root not found");
+        const blob = await toBlob(el as HTMLElement, { pixelRatio: 2 });
+        if (!blob) throw new Error("empty snapshot blob");
+        return { visualSnapshot: blob, capturedAt: new Date().toISOString() };
+      } catch (err) {
+        // Never throw out of the handler; return a structured, cloneable error.
+        return { ok: false, error: (err as Error).message };
+      }
+    });
 
-  if (!ticker) {
-    return <EmptyState message="No stock selected" hint="Pick a stock from the portfolio panel." />;
-  }
+    // 2) State snapshot — return the current JSON state of the dashboard.
+    const offSnapshot = sdk.onRequest("dashboard.capture.snapshot", () => {
+      try {
+        return snapshotRef.current();
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    });
 
-  if (!session.token) {
-    return <div style={{ padding: 16, textAlign: "center", color: "#9ca3af", fontSize: 13 }}>Waiting for session...</div>;
-  }
+    // DO NOT call sdk.ready() here. The SDK auto-sends dashboard:ready on
+    // host:init. Calling it manually races the handshake and breaks it.
 
-  return <div>Chart for {ticker}</div>;
+    return () => {
+      offVisual();
+      offSnapshot();
+    };
+  }, []);
+
+  // ... render ...
 }
 ```
 
-Important: always include `session.token` in `useEffect` dependency arrays alongside ticker or other context values. If the session refreshes, widgets must re-fetch automatically.
+**`dashboard.capture.snapshot` expected return shape** (host reads the dashboard's current state):
+
+```json
+{
+  "context":   { "ticker": "AAPL", "filters": [ /* ... */ ] },
+  "selection": { /* selected items inside the dashboard */ },
+  "data":      { /* aggregated data */ }
+}
+```
+
+**`dashboard.capture.visual`** returns `{ visualSnapshot: Blob, capturedAt: string }`. A `Blob` is structured-cloneable — return it directly, never Base64.
 
 ---
 
-### Communication Standards
+### 6. Context Contracts (exact shapes the host sends)
 
-Use SDK request/response patterns for:
+Context arrives on the message channel as envelopes of kind `host:init` (on load) and `host:context:update` (on login/ticker/route change), with the data at `envelope.payload.context`. The SDK caches it; you read it via `getContext()` (section 4).
 
-- Context retrieval
-- User selections
-- Host-controlled actions
-- Operations requiring acknowledgment
+**`context.session`** — JWT/identity:
 
-Use SDK publish/subscribe patterns for:
-
-- Filter changes
-- Dashboard interactions
-- Widget events
-- Analytics events
-- Dashboard telemetry
-
-Topic names must be namespaced.
-
-Examples:
-
-```text
-portfolio.ticker.select
-analytics.filter.change
-dashboard.metric
-dashboard.error
+```ts
+context.session = {
+  token:    string | null,  // JWT — Bearer token for Munshot APIs
+  userName: string | null,
+  email:    string | null,
+  orgId:    string | null,
+  orgName:  string | null,
+}
 ```
 
-For large dashboard fleets:
+- On iframe load the host sends `host:init` with the full context including the token.
+- On login/session refresh the host pushes `host:context:update` with a new token.
+- On logout `token` becomes `null` and an update is pushed immediately.
+- The host forwards the token regardless of your dashboard's domain. Your deployed domain must still be **CORS-allowlisted on the Munshot APIs** for requests to succeed.
 
-- Use namespaced topics such as `analytics.filter.change` and `portfolio.ticker.select`.
-- Keep payloads small and pass references/IDs for large datasets.
-- Use request/response for critical workflows needing acknowledgement.
-- Use event topics for fire-and-forget telemetry.
-- Register wildcard handlers (`*`) only for observability pipelines.
+**`context.market`** — selected ticker:
+
+```ts
+context.market = {
+  selectedTicker:        string | null,  // "AAPL", "RELIANCE"
+  selectedTickerCompany: string | null,  // "Apple Inc."
+  selectedTickerCountry: string | null,  // "US", "IN"
+  selectedSymbol:        string | null,  // TradingView, "NASDAQ:AAPL"
+}
+```
+
+**`context.app`** — host navigation state:
+
+```ts
+context.app = {
+  route:            string | null,  // e.g. "/dashboard"
+  query:            string | null,  // e.g. "?category=analytics"
+  viewMode:         string | null,  // "grid" | "list"
+  selectedCategory: string | null,
+  searchQuery:      string | null,
+}
+```
 
 ---
 
-### Visual UI Snapshots For Export
+### 7. Using Token + Ticker (and required states)
 
-In addition to data snapshots, the Munshot host may request a visual image snapshot of the dashboard's current UI on the dedicated SDK request channel:
+Wait for both `session.token` and (if your dashboard is ticker-bound) `ticker`. Always include `session.token` in the dependency array so widgets re-fetch when the session refreshes.
 
-```text
-dashboard.capture.visual
+```tsx
+import { useEffect, useState } from "react";
+import { useHostContext } from "../hooks/useHostContext";
+
+function ExampleWidget() {
+  const { session, ticker } = useHostContext();
+  const [data, setData] = useState<unknown>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!session.token) return;       // session not ready yet
+    if (!ticker) return;              // (only if this widget needs a ticker)
+    const ctrl = new AbortController();
+    fetch(`https://<munshot-api>/your/endpoint?ticker=${ticker}`, {
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+        "Content-Type": "application/json",
+      },
+      signal: ctrl.signal,
+    })
+      .then((r) => r.json())
+      .then(setData)
+      .catch((e) => { if (!ctrl.signal.aborted) setError(String(e)); });
+    return () => ctrl.abort();
+  }, [ticker, session.token]); // re-fetch if EITHER changes
+
+  if (!session.token)
+    return (
+      <div style={{ padding: 16, textAlign: "center", color: "#9ca3af", fontSize: 13 }}>
+        Waiting for session…
+      </div>
+    ); // non-blocking; token=null is transient on load. Never a full-page error.
+
+  if (!ticker) return <EmptyState message="No stock selected" hint="Pick a stock from the portfolio panel." />;
+  if (error)   return <ErrorState message={error} />;
+  return <div>{/* render data */}</div>;
+}
 ```
 
-When this request is received, the dashboard must capture Zone 2, the scrollable main content area, and return the image as a native `Blob`.
+Rules:
+- `token === null` → show a small "Waiting for session…" notice **inside the widget**, never a full-page error (it's transient on load).
+- `selectedTicker === null` → show an empty state and **do not** call ticker-dependent APIs.
+- Never hardcode a ticker. For TradingView widgets use `selectedSymbol` (`"EXCHANGE:TICKER"`).
 
-Implementation rules:
+---
 
-- Use the `html-to-image` library.
-- Capture the stable main content target: `#dashboard-main`, `[data-dashboard-capture-root="true"]`, or the main scrollable container.
-- Handle capture asynchronously.
-- Return a native `Blob`, not a Base64 string.
-- Use `pixelRatio: 2` for a sharper export.
-- Throw a clear error if the main content container cannot be found or capture fails.
+### 8. Dashboard → Host (telemetry, requests, errors)
 
-Required dependency:
+- **Fire-and-forget events** (analytics/telemetry) — `publish`:
 
-```bash
-npm install html-to-image
-```
+  ```ts
+  sdk.publish("dashboard.metric", { widget: "heatmap", action: "tile-click", value: "tech" });
+  ```
 
-Example pattern:
+- **Request/response to the host** (needs an answer) — `request` (this is the only method that returns a Promise; it rejects on timeout, default 15s):
 
-```typescript
-import { toBlob } from "html-to-image";
+  ```ts
+  const res = await sdk.request("portfolio.get-selection", {}, { timeoutMs: 8000 });
+  ```
 
-sdk.onRequest("dashboard.capture.visual", async () => {
-  const mainElement =
-    document.querySelector("#dashboard-main") ||
-    document.querySelector("[data-dashboard-capture-root='true']") ||
-    document.querySelector("main");
+- **Report an error to the host** — `sendError(message, code, details)` (note the three positional args):
 
-  if (!mainElement) {
-    throw new Error("Main content container not found for visual snapshot");
-  }
+  ```ts
+  sdk.sendError("Failed to load revenue", "REVENUE_FETCH_FAILED", { ticker });
+  ```
 
-  try {
-    const imageBlob = await toBlob(mainElement as HTMLElement, {
-      pixelRatio: 2,
-    });
+Use namespaced topics (`analytics.filter.change`, `portfolio.ticker.select`). Keep payloads small (≤ 512 KB) and structured-cloneable; pass IDs/references for large datasets.
 
-    if (!imageBlob) {
-      throw new Error("Visual snapshot capture returned an empty Blob");
-    }
+---
 
-    return {
-      visualSnapshot: imageBlob,
-      capturedAt: new Date().toISOString(),
-    };
-  } catch (err) {
-    console.error("Failed to capture visual snapshot:", err);
-    throw new Error("Failed to capture visual snapshot");
-  }
+### 9. Host → Dashboard Events (optional)
+
+The host publishes `host:event` topics, delivered to `sdk.onTopic(...)`. Currently the host emits one on successful connection (handling it is optional):
+
+```ts
+// topic: "host.connected", data: { text, sentAt, route }
+const off = sdk.onTopic("host.connected", (t) => {
+  console.info("connected:", t.data);
 });
 ```
 
-Do not convert the visual snapshot to Base64 unless the host explicitly requires it. `Blob` transfer is faster and avoids SDK payload size limits because it can move through the browser structured clone algorithm.
+There are currently no `host:command` messages. Register `onTopic("*", ...)` only for observability/logging.
 
 ---
 
-### Security And Reliability Defaults
+### 10. Message Model (reference)
 
-The SDK provides these defaults and generated dashboards must not bypass them:
+Versioned envelope (every message):
 
-- Cross-origin token redaction by default.
-- Origin locking on first valid message when an allow-list is not preconfigured.
-- Payload size limits using `DEFAULT_SDK_MAX_PAYLOAD_BYTES`.
-- Structured cloning for payload safety.
-- Request timeout handling using `DEFAULT_SDK_REQUEST_TIMEOUT_MS`.
-- Message queueing for pre-ready iframes.
+```ts
+{
+  namespace: "munshot-dashboard-sdk",
+  version:   "1.0.0",
+  channelId: string,                 // assigned by the host on host:init
+  source:    "host" | "dashboard",
+  kind:      string,                 // see below
+  timestamp: number,
+  requestId?: string,                // correlation id for requests/responses
+  payload?:  any,
+}
+```
 
----
-
-### Publishing And Distribution
-
-Use one of the SDK distribution channels supported by Munshot:
-
-1. npm/internal package
-   - Publish `src/sdk/dashboards` as `@munshot/dashboard-sdk`.
-   - Consumer dashboards install and import the client SDK directly.
-
-2. Browser bundle
-   - Build browser entry `src/sdk/dashboards/browser.ts`.
-   - Host it on the Munshot static asset domain or CDN.
-   - Dashboard apps load it with the script tag and use `window.MunshotDashboardSDK`.
-
-Versioning rules:
-
-- Follow semver for protocol changes.
-- Use minor versions for backward-compatible additions.
-- Use major versions for breaking envelope or behavior changes.
-- Keep `DASHBOARD_SDK_VERSION` aligned with the published package/tag.
+Kinds the dashboard receives (host→dashboard): `host:init`, `host:context:update`, `host:event`, `host:command`, `host:request`, `host:response`. Context is always at `payload.context`. After `host:init` sets the `channelId`, the SDK ignores later messages whose `channelId` does not match.
 
 ---
 
-### Security Requirements
+### 11. SDK API Reference (verified)
 
-Generated dashboards must:
+**Constructor config** (`createDashboardClientSdk(config)`):
 
-- Trust only SDK-authorized host communication.
-- Validate all incoming payloads.
-- Handle missing or malformed context safely.
-- Respect SDK origin validation.
-- Use HTTPS for all external communication.
-- Avoid exposing sensitive session data.
-- Avoid transmitting secrets through dashboard state.
+| Option | Default | Notes |
+| --- | --- | --- |
+| `dashboardId` | — (required) | throws if empty |
+| `dashboardName` | `= dashboardId` | |
+| `autoReady` | `true` | **leave true** |
+| `requestTimeoutMs` | `15000` | for `request()` |
+| `maxPayloadBytes` | `524288` | 512 KB hard cap on every outgoing payload |
+| `lockOriginOnFirstMessage` | `true` | locks to the first host origin seen |
+| `allowedOrigins` | none | optional explicit allow-list |
+| `targetWindow` | `window.parent ?? window.opener` | |
+| `targetOrigin` | `"*"` | locked to host origin after first message |
+
+**Client methods:**
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `getContext()` | `HostContext \| null` | **synchronous**; latest cached context. Primary way to read context. |
+| `getChannelId()` | `string \| null` | |
+| `onMessage(fn)` | `() => void` | `fn(envelope, { origin })`; returns unsubscribe |
+| `onTopic(topic, fn)` | `() => void` | `fn({topic,data,metadata}, meta, envelope)`; topics lowercased; `"*"` wildcard |
+| `onRequest(topic, fn)` | `() => void` | return value → response; **must not throw / must be cloneable & ≤512 KB**; `"*"` wildcard |
+| `ready()` | `boolean` | auto-called by the SDK; **do not call manually** |
+| `requestContext()` | `boolean` | fire-and-forget nudge; **not** a Promise; no-ops until the channel exists |
+| `publish(topic, data, metadata)` | `boolean` | pub/sub event to host |
+| `request(topic, data, opts)` | `Promise<any>` | request/response; rejects on timeout |
+| `sendError(message, code, details)` | `boolean` | |
+| `destroy()` | `void` | removes the window listener |
 
 ---
 
-### Error Handling
+### 12. The Connection Handshake (what happens, and why the rules)
 
-Generated dashboards must:
+```
+1. Host renders the iframe and (on load) posts `host:init` with the full
+   context (incl. token) and a unique channelId.
+2. Your SDK client — created at module load — receives host:init, caches the
+   context, records the channelId, and (because autoReady is true) AUTO-SENDS
+   `dashboard:ready` back to the host using that channelId.
+3. Host receives a dashboard:ready it can correlate -> marks the dashboard
+   connected, flushes any queued messages, and may emit `host.connected`.
+4. Your useHostContext onMessage fires -> getContext() returns session/market
+   -> widgets render and fetch with the Bearer token.
+5. Logins / ticker / route changes arrive later as `host:context:update` and
+   re-sync the same way.
+```
 
-- Handle SDK initialization failures.
-- Handle missing host context.
-- Handle request timeouts.
-- Display user-friendly error states.
-- Publish dashboard errors through SDK mechanisms when appropriate.
+If you call `ready()` yourself from a mount effect, step 2 happens **too early** (before `host:init`, so before the `channelId` exists). The ready goes out with a placeholder channel the host can't match, and — if you also disabled `autoReady` — the SDK never re-sends a correct one. The host waits forever, queued requests (e.g. `dashboard.capture.snapshot`) time out, and the dashboard appears "stuck on Waiting for session…". **This is the single most common failure. Don't do it.**
 
 ---
 
-### Dashboard Generation Rules
+### 13. DO NOT (every trap, with its symptom)
 
-When generating dashboards, Claude must:
+| Don't | Symptom |
+| --- | --- |
+| Set `autoReady: false` | Handshake never completes; stuck on "Waiting for session…" |
+| Call `sdk.ready()` manually | Ready races `host:init`, sent with placeholder channel → never connects |
+| `await` / `.then` / `.catch` on `requestContext()` | `TypeError: ... is not a function` (it returns a boolean) → blank page |
+| Throw inside an `onRequest` handler | Host gets an error response or (if non-serializable) a timeout |
+| Return non-cloneable (functions, DOM nodes) or >512 KB from a handler | Response silently dropped → host times out |
+| Create more than one SDK client | Duplicate channels, lost messages |
+| Load the SDK with `type="module"` / `defer` | `createDashboardClientSdk` missing on the global; falls back to no-op silently |
+| Read context by parsing envelopes by hand instead of `getContext()` | Fragile; breaks on shape changes |
+| Hardcode tokens/tickers, build a login page, store secrets | Violates the host auth model; rejected in review |
 
-- Include SDK integration by default.
-- Use SDK communication instead of custom postMessage implementations.
-- Use host-provided context whenever possible.
-- Implement `dashboard.capture.visual` for export workflows.
-- Keep dashboard logic independent of authentication implementation details.
-- Assume dashboards run inside a Munshot iframe environment.
+---
+
+### 14. Pre-Submission Checklist
+
+- [ ] SDK loaded as a **classic** `<script>` in `<head>` (no `module`/`async`/`defer`).
+- [ ] **One** SDK client created at module load in `src/lib/sdk.ts`.
+- [ ] `autoReady` left at default; **no manual `sdk.ready()`** anywhere.
+- [ ] Context consumed via `useHostContext` (`getContext()` + `onMessage` re-sync).
+- [ ] All API calls use `Authorization: Bearer ${session.token}`.
+- [ ] `token === null` → in-widget "Waiting for session…", never a full-page error.
+- [ ] `selectedTicker === null` → empty state; no ticker-dependent calls.
+- [ ] `dashboard.capture.visual` returns a `Blob` of `#dashboard-main`.
+- [ ] `dashboard.capture.snapshot` returns bounded, cloneable `{ context, selection, data }`.
+- [ ] Every `onRequest` handler is wrapped so it never throws and never returns >512 KB / non-cloneable data.
+- [ ] No hardcoded tokens/tickers, no standalone login, no secrets in the bundle.
+- [ ] Deployed dashboard domain is CORS-allowlisted on the Munshot APIs (host-side, coordinate with the platform team).
