@@ -252,6 +252,56 @@ datasources:
     required: true
     description: Analyst output ID where the run is persisted.
   cache_ttl_seconds: 0
+- id: portfolio_list
+  name: Portfolio List
+  description: Retrieve the user's portfolio or watchlist items with stock details such as ticker, company, sector, and industry.
+  service: nestjs
+  endpoint: GET /portfolio/list
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 60
+  request_fields: []
+  response:
+    type: object[]
+    fields:
+    - field: id
+      type: string
+      required: true
+      description: Portfolio item UUID.
+    - field: ticker
+      type: string
+      required: true
+      description: Stock ticker symbol.
+    - field: rank
+      type: integer
+      required: true
+      description: Ordering or ranking position of the portfolio item.
+    - field: createdAt
+      type: datetime
+      required: true
+      description: Timestamp when the portfolio item was added.
+    - field: groupId
+      type: string
+      required: true
+      description: Portfolio or watchlist group UUID.
+    - field: company_name
+      type: string
+      required: false
+      description: Full company name.
+    - field: country
+      type: string
+      required: false
+      description: Country where the company operates.
+    - field: sector
+      type: string|null
+      required: false
+      description: Company sector classification.
+    - field: industry
+      type: string|null
+      required: false
+      description: Company industry classification.
+  cache_ttl_seconds: 300
 auth_defaults:
   timeout_seconds: 30
   retry_attempts: 3
