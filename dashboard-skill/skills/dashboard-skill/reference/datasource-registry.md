@@ -302,6 +302,46 @@ datasources:
       required: false
       description: Company industry classification.
   cache_ttl_seconds: 300
+- id: email_send
+  name: Email Send (Raw)
+  description: Send a transactional email (subject + HTML or plain-text body) to a single recipient. Used to deliver designed dashboard content — reports, editions, briefs — to a user's inbox.
+  service: nestjs
+  endpoint: POST /email/send/raw
+  auth:
+    type: bearer_jwt
+  rate_limit:
+    requests_per_minute: 30
+  request_fields:
+  - field: email
+    type: string
+    required: true
+    description: Recipient email address. Exactly one recipient per request.
+  - field: subject
+    type: string
+    required: true
+    description: Email subject line.
+  - field: html
+    type: string
+    required: false
+    description: HTML email body. Provide EITHER html OR text — exactly one, never both, never neither. Use inline styles and table layouts for email-client (Gmail) compatibility.
+  - field: text
+    type: string
+    required: false
+    description: Plain-text email body. Mutually exclusive with html.
+  response_fields:
+  - field: success
+    type: boolean
+    required: true
+    description: Whether the email was accepted for delivery.
+  - field: message
+    type: string
+    required: true
+    description: Human-readable status (e.g. "Email sent successfully!") or error reason.
+  - field: data
+    type: object
+    required: false
+    description: Nested envelope; data.message carries the server's detail message.
+  cache_ttl_seconds: 0
 auth_defaults:
   timeout_seconds: 30
   retry_attempts: 3
